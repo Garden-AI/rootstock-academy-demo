@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# === Sophia (ALCF) driver for demos/academy_mlip_committee.py ==============
+#PBS -N academy-committee
+#PBS -A Garden-AI
+#PBS -q by-gpu
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=01:45:00
+#PBS -l filesystems=home:eagle
+#PBS -j oe
+# ==========================================================================
+#
+# Companion to academy_committee_delta.sbatch — same demo, ALCF flavor.
+# Sophia facts baked in from notes/Cluster Sophia.md and the nightly PBS
+# driver: PBS does NOT propagate the submit shell's environment, compute
+# nodes reach the internet only via the ALCF proxy, and uv lives in
+# ~/.local/bin.
+#
+# Stage the demo (from rootstock-scratch/):
+#   scp demos/academy_mlip_committee.py demos/mp_seeds.extxyz \
+#       demos/academy_committee_sophia.pbs sophia:~/
+# (mp_seeds.extxyz comes from fetch_mp_structures.py, run wherever you have
+#  an MP_API_KEY — the demo itself never talks to Materials Project.)
+#
+# Kickoff (from the directory holding these files):
+#   qsub academy_committee_sophia.pbs
+# Extra demo args go via -v (PBS has no sbatch-style passthrough):
+#   qsub -v EXTRA_ARGS="--rounds 8 --pool-size 5" academy_committee_sophia.pbs
+
+set -euo pipefail
+
+umask 0002
+export PATH="$HOME/.local/bin:$PATH"   # uv (PBS jobs start with minimal PATH)
+cd "${PBS_O_WORKDIR:-$HOME}"
+
+# ALCF compute nodes have no direct outbound network; uv resolving the demo's
+# PEP 723 deps and any checkpoint gating re-check need the proxy.
+export HTTP_PROXY="${HTTP_PROXY:-http://proxy.alcf.anl.gov:3128}"
+export HTTPS_PROXY="${HTTPS_PROXY:-http://proxy.alcf.anl.gov:3128}"
+export http_proxy="$HTTP_PROXY"
+export https_proxy="$HTTPS_PROXY"
+
+# Stream progress into the PBS .o file as it happens.
+export PYTHONUNBUFFERED=1
+# Worker-side log to a real file: "stderr" would vanish into the server's
+# captured tempfiles (see notes/Diagnosing a Hung Calculator Start.md).
+export ROOTSTOCK_WORKER_LOG="${PBS_O_WORKDIR:-$PWD}/rootstock-workers-${PBS_JOBID:-manual}.log"
+
+if [[ -f ~/.cache/huggingface/token ]]; then
+  export HF_TOKEN="$(cat ~/.cache/huggingface/token)"
+  export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+fi
+
+nvidia-smi | head -4 || true
+echo "=== academy_mlip_committee.py (cluster=sophia) ==="
+
+# Quorum start: campaign begins at 3 warm members, stragglers join
+# mid-flight; generous worker timeout for cold-cache model loads (see
+# notes/Cold-Start Performance on Lustre.md — Eagle is also a shared
+# parallel FS, and this is the first committee run there).
+uv run academy_mlip_committee.py \
+  --cluster sophia \
+  --outdir "committee_results_${PBS_JOBID%%.*}" \
+  --timeout 2700 \
+  --rounds 6 \
+  --round-pause 60 \
+  ${EXTRA_ARGS:-}
