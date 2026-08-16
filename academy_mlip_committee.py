@@ -696,8 +696,10 @@ class Curator(Agent):
 # Driver
 # --------------------------------------------------------------------------
 
-def resolve_committee(root: Path, requested: list[str] | None, size: int) -> list[str]:
-    """Pick the committee from checkpoints the manifest says are verified."""
+def resolve_committee(root: Path, cluster: str, requested: list[str] | None,
+                      size: int) -> list[str]:
+    """Pick the committee from checkpoints the manifest says are verified on
+    ``cluster``."""
     from rootstock.manifest import is_verified, load_manifest
 
     manifest = load_manifest(root)
@@ -706,7 +708,7 @@ def resolve_committee(root: Path, requested: list[str] | None, size: int) -> lis
     verified: dict[str, str] = {}  # checkpoint id -> env name
     for env_name, env in manifest.environments.items():
         for ckpt_id, ckpt in env.checkpoints.items():
-            if is_verified(env, ckpt):
+            if is_verified(env, ckpt, cluster):
                 verified[ckpt_id] = env_name
 
     if requested:
@@ -1006,7 +1008,7 @@ async def main() -> None:
 
         root = Path(args.root) if args.root else get_cluster(args.cluster).root
         requested = args.committee.split(",") if args.committee else None
-        pool = resolve_committee(root, requested, args.pool_size)
+        pool = resolve_committee(root, args.cluster, requested, args.pool_size)
     print(f"member pool: {', '.join(pool)}")
 
     import sys
