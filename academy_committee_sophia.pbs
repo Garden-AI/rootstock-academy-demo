@@ -64,3 +64,7 @@ uv run academy_mlip_committee.py \
   --rounds 6 \
   --round-pause 60 \
   ${EXTRA_ARGS:-}
+
+# Interactive report (self-contained HTML) next to the JSON.
+uv run report_html.py \
+  "committee_results_${PBS_JOBID%%.*}/committee_report.json" || true

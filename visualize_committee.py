@@ -40,7 +40,8 @@ MUTED = "#898781"
 GRID = "#e1e0d9"
 BASELINE = "#c3c2b7"
 
-ARM_CAPS = {"rattle": 0.35, "strain": 0.08, "vacancy": 3.0, "swap": 0.5}
+ARM_CAPS = {"rattle": 0.35, "strain": 0.08, "vacancy": 3.0, "swap": 0.5,
+            "delith": 0.5, "hop": 1.6, "antisite": 0.3}
 
 
 def style_axes(ax) -> None:

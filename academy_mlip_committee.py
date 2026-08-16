@@ -5,6 +5,7 @@
 #     "rootstock>=1.2",  # 1.2's parallel prewarm matters on cold Lustre
 #     "ase>=3.22",
 #     "numpy",
+#     "rich>=13",  # live TUI (--no-tui for plain logs)
 # ]
 # ///
 """Academy x Rootstock: a multi-MLIP query-by-committee campaign.
@@ -33,6 +34,14 @@ Try the wiring anywhere, no cluster required (EMT stand-ins for the MLIPs;
 falls back to built-in Cu/Au seeds if mp_seeds.extxyz is absent):
 
     uv run academy_mlip_committee.py --mock
+    uv run academy_mlip_committee.py --mock --builtin battery   # Li-ion seeds
+
+Seeds with a mobile alkali (Li/Na/K) get battery-flavoured perturbation
+arms: *delith* (remove mobile ions — the delithiation path), *hop* (kick
+one mobile ion toward a neighbouring site — the migration precursor) and
+*antisite* (mobile/transition-metal cation exchange — the LiFePO4/LiNiO2
+defect); other seeds keep rattle/strain/vacancy/swap. Live progress renders
+as a terminal dashboard (rich); pass --no-tui for plain line logging.
 
 The member pool is chosen automatically from checkpoints the install's
 manifest marks verified (in COMMITTEE_PREFERENCE order), so the demo tracks
@@ -51,7 +60,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import math
 import time
 import zlib
 from concurrent.futures import ThreadPoolExecutor
@@ -78,12 +86,21 @@ COMMITTEE_PREFERENCE = [
     "sevennet-omat",
     "sevennet-mf-ompa",
     "chgnet-default",
+    # Distinct lineages verified on Polaris (sevennet/mattersim are not there):
+    "grace-2l-smax-omat-large",
+    "pet-omatpes-l",
     "mattersim-v1-0-0-5m",
     # uma-s-1p1 removed 2026-07-30: its 14 GB checkpoint cache blows cold-node
     # warm-up budgets until rootstock prewarms weights (issues #177/#178).
     # Re-add once that ships — it's a strong committee member on warm nodes.
 ]
 
+
+# Mobile ions that turn a seed into a "battery" seed (delith/hop/antisite
+# arms), and the transition metals they exchange with in the antisite arm.
+MOBILE_SPECIES = (3, 11, 19, 12)  # Li, Na, K, Mg — first one present wins
+TRANSITION_METALS = frozenset(list(range(21, 31)) + list(range(39, 49))
+                              + list(range(72, 81)))
 
 # --------------------------------------------------------------------------
 # Structures cross the agent boundary as plain dicts of lists so the demo
@@ -114,8 +131,21 @@ def payload_to_atoms(payload: dict) -> Atoms:
     return atoms
 
 
+def supercell_to(atoms: Atoms, min_atoms: int) -> Atoms:
+    """Replicate along the shortest lattice vector until >= min_atoms.
+
+    Keeps cells roughly equiaxed without cubing the atom count (a 28-atom
+    olivine cell becomes 56 atoms, not 224).
+    """
+    reps = np.ones(3, dtype=int)
+    while len(atoms) * int(np.prod(reps)) < min_atoms:
+        lengths = atoms.cell.lengths() * reps
+        reps[int(np.argmin(lengths))] += 1
+    return atoms * tuple(int(r) for r in reps)
+
+
 def load_seeds(path: Path, min_atoms: int = 32) -> dict[str, Atoms]:
-    """Read seed frames (from fetch_mp_structures.py) and supercell them."""
+    """Read seed frames (from fetch_*_seeds.py) and supercell them."""
     from ase.io import read as ase_read
 
     seeds: dict[str, Atoms] = {}
@@ -124,8 +154,7 @@ def load_seeds(path: Path, min_atoms: int = 32) -> dict[str, Atoms]:
         base, n = name, 2
         while name in seeds:
             name, n = f"{base}-{n}", n + 1
-        rep = max(1, math.ceil((min_atoms / len(atoms)) ** (1 / 3)))
-        seeds[name] = atoms * (rep, rep, rep)
+        seeds[name] = supercell_to(atoms, min_atoms)
     return seeds
 
 
@@ -141,11 +170,41 @@ def builtin_mock_seeds(min_atoms: int = 32) -> dict[str, Atoms]:
         "Au": bulk("Au", "fcc", a=4.078, cubic=True),
         "Cu3Au": cu3au,
     }
-    out = {}
+    return {name: supercell_to(atoms, min_atoms) for name, atoms in frames.items()}
+
+
+def builtin_battery_seeds(min_atoms: int = 32) -> dict[str, Atoms]:
+    """Textbook Li-ion phases from literature lattice parameters, so
+    ``--mock --builtin battery`` runs without a Materials Project fetch.
+    (The real campaign uses fetch_battery_seeds.py -> battery_seeds.extxyz.)"""
+    from ase.spacegroup import crystal
+
+    frames: dict[str, Atoms] = {}
+    # Layered O3 cathodes, R-3m: Li 3a, TM 3b, O 6c.
+    for tm, a, c, z_o in (("Co", 2.816, 14.05, 0.2395), ("Ni", 2.878, 14.19, 0.2415)):
+        frames[f"Li{tm}O2"] = crystal(
+            ["Li", tm, "O"], [(0, 0, 0), (0, 0, 0.5), (0, 0, z_o)],
+            spacegroup=166, cellpar=[a, a, c, 90, 90, 120])
+    # Spinel LiMn2O4, Fd-3m (origin choice 2): Li 8a, Mn 16d, O 32e.
+    frames["LiMn2O4"] = crystal(
+        ["Li", "Mn", "O"], [(0.125, 0.125, 0.125), (0.5, 0.5, 0.5), (0.263, 0.263, 0.263)],
+        spacegroup=227, cellpar=[8.24] * 3 + [90] * 3, setting=2)
+    # Olivine LiFePO4, Pnma.
+    frames["LiFePO4"] = crystal(
+        ["Li", "Fe", "P", "O", "O", "O"],
+        [(0, 0, 0), (0.2822, 0.25, 0.9748), (0.0949, 0.25, 0.4182),
+         (0.0968, 0.25, 0.7428), (0.4573, 0.25, 0.2059), (0.1655, 0.0466, 0.2851)],
+        spacegroup=62, cellpar=[10.33, 6.01, 4.69, 90, 90, 90])
+    # Antifluorite Li2O, Fm-3m: Li 8c, O 4a.
+    frames["Li2O"] = crystal(["Li", "O"], [(0.25, 0.25, 0.25), (0, 0, 0)],
+                             spacegroup=225, cellpar=[4.61] * 3 + [90] * 3)
+    frames["Li"] = bulk("Li", "bcc", a=3.51, cubic=True)
+    # Graphite anode, P6_3/mmc: C 2b + 2c.
+    frames["C"] = crystal(["C", "C"], [(0, 0, 0.25), (1 / 3, 2 / 3, 0.25)],
+                          spacegroup=194, cellpar=[2.46, 2.46, 6.71, 90, 90, 120])
     for name, atoms in frames.items():
-        rep = max(1, math.ceil((min_atoms / len(atoms)) ** (1 / 3)))
-        out[name] = atoms * (rep, rep, rep)
-    return out
+        atoms.info["seed_name"] = name
+    return {name: supercell_to(atoms, min_atoms) for name, atoms in frames.items()}
 
 
 class _MockMLIP:
@@ -156,16 +215,25 @@ class _MockMLIP:
     adaptive loop to visibly chase disorder.
     """
 
+    # Elements ASE's EMT parametrises; anything else falls back to a soft
+    # Morse pair potential so battery-style seeds (Li/Co/O/P...) still run
+    # in --mock (a hard r^-12 wall explodes on rattled 1.5 A P-O bonds).
+    _EMT_SPECIES = {"Al", "Cu", "Ag", "Au", "Ni", "Pd", "Pt", "H", "C", "N", "O"}
+
     def __init__(self, member_index: int):
         from ase.calculators.emt import EMT
+        from ase.calculators.morse import MorsePotential
 
         self._emt = EMT()
-        self._scale = 1.0 + 0.04 * member_index
+        self._lj = MorsePotential(epsilon=0.25, r0=2.0, rho0=3.5,
+                                  rcut1=2.5, rcut2=3.2)
+        self._scale = 1.0 + 0.015 * member_index
         self._noise = 0.01 + 0.015 * member_index
         self._seed = 1000 + member_index
 
     def evaluate(self, atoms: Atoms) -> tuple[float, np.ndarray]:
-        atoms.calc = self._emt
+        symbols = set(atoms.get_chemical_symbols())
+        atoms.calc = self._emt if symbols <= self._EMT_SPECIES else self._lj
         energy = atoms.get_potential_energy() * self._scale
         forces = atoms.get_forces() * self._scale
         structure_key = zlib.crc32(np.ascontiguousarray(atoms.positions).tobytes())
@@ -323,18 +391,47 @@ class Curator(Agent):
         self._status_note = "starting campaign"
         self._done = False
         self._report: dict | None = None
+        # Live telemetry for the driver's dashboard / event log.
+        self._events: list[dict] = []
+        self._t0 = time.monotonic()
+        self._member_stats: dict[str, dict] = {
+            name: {"n_evals": 0, "last_batch_s": None, "state": "seated"}
+            for name in active}
+        self._best_per_round: list[float] = []
+        self._emit("campaign_start", members=sorted(active),
+                   n_arms=len(self._arms), n_seeds=len(self._seeds))
+
+    def _emit(self, kind: str, **data) -> None:
+        self._events.append({"t": round(time.monotonic() - self._t0, 2),
+                             "round": self._round, "kind": kind, **data})
 
     # -- proposal ----------------------------------------------------------
+
+    @staticmethod
+    def _mobile_species(atoms: Atoms) -> int | None:
+        present = set(atoms.numbers.tolist())
+        return next((z for z in MOBILE_SPECIES if z in present), None)
 
     def _make_arms(self) -> list[_Arm]:
         arms = []
         for seed_name, atoms in self._seeds.items():
             arms.append(_Arm(seed_name, "rattle", magnitude=0.05, cap=0.35))
             arms.append(_Arm(seed_name, "strain", magnitude=0.02, cap=0.08))
-            arms.append(_Arm(seed_name, "vacancy", magnitude=1.0, cap=3.0))
-            if len(set(atoms.numbers)) >= 2:
-                # Antisite disorder — only meaningful for intermetallics.
-                arms.append(_Arm(seed_name, "swap", magnitude=0.1, cap=0.5))
+            mobile = self._mobile_species(atoms)
+            if mobile is not None:
+                # Battery seed: the physics that matters is what happens to
+                # the mobile ion.  Magnitudes: fraction of mobile ions
+                # removed; hop displacement in Å; fraction of mobile ions
+                # exchanged with transition-metal sites.
+                arms.append(_Arm(seed_name, "delith", magnitude=0.1, cap=0.5))
+                arms.append(_Arm(seed_name, "hop", magnitude=0.5, cap=1.6))
+                if TRANSITION_METALS & set(atoms.numbers.tolist()):
+                    arms.append(_Arm(seed_name, "antisite", magnitude=0.05, cap=0.3))
+            else:
+                arms.append(_Arm(seed_name, "vacancy", magnitude=1.0, cap=3.0))
+                if len(set(atoms.numbers)) >= 2:
+                    # Antisite disorder — only meaningful for intermetallics.
+                    arms.append(_Arm(seed_name, "swap", magnitude=0.1, cap=0.5))
         return arms
 
     def _apply_transform(self, arm: _Arm) -> Atoms:
@@ -352,12 +449,42 @@ class Curator(Agent):
             keep = rng.choice(len(atoms), size=len(atoms) - n_vac, replace=False)
             atoms = atoms[np.sort(keep)]
             atoms.positions += rng.normal(0.0, 0.03, atoms.positions.shape)
-        elif arm.transform == "swap":
+        elif arm.transform == "delith":
+            # Remove a fraction of the mobile ions (delithiation path). The
+            # remaining lattice gets a small rattle so forces are non-trivial.
+            mobile = self._mobile_species(atoms)
+            idx = np.flatnonzero(atoms.numbers == mobile)
+            n_rm = max(1, int(round(arm.magnitude * len(idx))))
+            drop = rng.choice(idx, size=min(n_rm, len(idx)), replace=False)
+            keep = np.setdiff1d(np.arange(len(atoms)), drop)
+            atoms = atoms[keep]
+            atoms.positions += rng.normal(0.0, 0.03, atoms.positions.shape)
+        elif arm.transform == "hop":
+            # Kick one mobile ion toward its nearest same-species neighbour
+            # (a migration-path midpoint at magnitude ~ half the hop length).
+            mobile = self._mobile_species(atoms)
+            idx = np.flatnonzero(atoms.numbers == mobile)
+            i = int(rng.choice(idx))
+            d = atoms.get_distances(i, idx, mic=True, vector=True)
+            norms = np.linalg.norm(d, axis=1)
+            norms[idx == i] = np.inf
+            j = int(np.argmin(norms))
+            direction = d[j] / norms[j] if np.isfinite(norms[j]) else rng.normal(size=3)
+            atoms.positions[i] += direction / np.linalg.norm(direction) * arm.magnitude
+            atoms.positions += rng.normal(0.0, 0.03, atoms.positions.shape)
+        elif arm.transform in ("swap", "antisite"):
             # Composition-preserving antisite pairs: exchange the species of
             # k A-sites with k B-sites (order-disorder along the L1_2/L1_0
-            # story), plus a small rattle to break the ideal-lattice symmetry.
+            # story; Li/TM cation mixing for battery seeds), plus a small
+            # rattle to break the ideal-lattice symmetry.
             numbers = atoms.numbers.copy()
-            species_a, species_b = np.unique(numbers)[:2]
+            if arm.transform == "antisite":
+                species_a = self._mobile_species(atoms)
+                tm = sorted(TRANSITION_METALS & set(numbers.tolist()))
+                # Most abundant TM is the antisite partner (Fe in LiFePO4).
+                species_b = max(tm, key=lambda z: int((numbers == z).sum()))
+            else:
+                species_a, species_b = np.unique(numbers)[:2]
             idx_a = np.flatnonzero(numbers == species_a)
             idx_b = np.flatnonzero(numbers == species_b)
             k = max(1, int(round(arm.magnitude * len(atoms) / 2)))
@@ -412,7 +539,10 @@ class Curator(Agent):
         if name in self._pool and name not in self._active:
             self._active.add(name)
             self._joined_round[name] = self._round
+            self._member_stats[name] = {"n_evals": 0, "last_batch_s": None,
+                                        "state": "seated"}
             self._status_note = f"{name} joined the committee"
+            self._emit("member_joined", member=name)
 
     @loop
     async def campaign(self, shutdown: asyncio.Event) -> None:
@@ -428,8 +558,17 @@ class Curator(Agent):
             if len(live) < 2:
                 self._status_note = "fewer than 2 healthy committee members; aborting"
                 break
+            for name in live:
+                self._member_stats[name]["state"] = "scoring"
+            self._emit("round_start", n=len(batch), members=sorted(live))
+
+            async def timed(name: str, handle: Handle):
+                t = time.monotonic()
+                res = await handle.evaluate_batch(payloads)
+                return name, res, time.monotonic() - t
+
             results = await asyncio.gather(
-                *(handle.evaluate_batch(payloads) for handle in live.values()),
+                *(timed(name, handle) for name, handle in live.items()),
                 return_exceptions=True,
             )
 
@@ -438,9 +577,17 @@ class Curator(Agent):
                 if isinstance(result, BaseException):
                     self._strikes[name] += 1
                     self._status_note = f"member {name} failed: {result!r}"
+                    self._member_stats[name]["state"] = (
+                        "dropped" if self._strikes[name] >= 2 else "strike")
+                    self._emit("member_failed", member=name,
+                               strikes=self._strikes[name], error=repr(result)[:120])
                 else:
+                    _, res, dt = result
                     self._strikes[name] = 0
-                    per_member[name] = result
+                    per_member[name] = res
+                    st = self._member_stats[name]
+                    st.update(n_evals=st["n_evals"] + len(payloads),
+                              last_batch_s=round(dt, 2), state="seated")
 
             best_this_round = None
             for i, cand in enumerate(batch):
@@ -454,6 +601,12 @@ class Curator(Agent):
                 cand["energy_spread_per_atom"] = round(e_spread, 4)
                 cand["energies"] = {n: round(r["energy"], 4)
                                     for n, r in member_results.items()}
+                # Per-member forces ride along (kept only for the selected
+                # top-k in the report) so report_html.py can draw each
+                # model's force arrows on the same atom.
+                cand["member_forces"] = {
+                    n: np.round(np.asarray(r["forces"]), 4).tolist()
+                    for n, r in member_results.items()}
                 self._candidates.append(cand)
                 if best_this_round is None or score > best_this_round["qbc_force_std"]:
                     best_this_round = cand
@@ -464,11 +617,19 @@ class Curator(Agent):
                     if (arm.seed_name == best_this_round["seed"]
                             and arm.transform == best_this_round["transform"]):
                         arm.magnitude = min(arm.magnitude * 1.35, arm.cap)
+                        escalated_to = arm.magnitude
                 self._status_note = (
                     f"best {best_this_round['qbc_force_std']:.3f} eV/A from "
                     f"{best_this_round['seed']}/{best_this_round['transform']}"
                     f"@{best_this_round['magnitude']}"
                 )
+                self._best_per_round.append(best_this_round["qbc_force_std"])
+                self._emit("round_done", best=best_this_round["qbc_force_std"],
+                           seed=best_this_round["seed"],
+                           transform=best_this_round["transform"],
+                           magnitude=best_this_round["magnitude"],
+                           escalated_to=round(escalated_to, 3),
+                           evaluated=len(self._candidates))
 
             if self._cfg.round_pause:
                 await asyncio.sleep(self._cfg.round_pause)
@@ -497,14 +658,32 @@ class Curator(Agent):
             } for arm in self._arms],
             "selected": ranked[: self._cfg.top_k],
         }
+        # Only the selected structures carry their (bulky) member forces.
+        selected_ids = {c["id"] for c in self._report["selected"]}
+        for cand in self._candidates:
+            if cand["id"] not in selected_ids:
+                cand.pop("member_forces", None)
+        self._emit("campaign_done", evaluated=len(self._candidates),
+                   top=[c["id"] for c in ranked[:3]])
         self._done = True
 
     @action
     async def status(self) -> dict:
+        arms = sorted(self._arms, key=lambda a: a.mean_score, reverse=True)
         return {"round": self._round, "rounds": self._cfg.rounds,
                 "members": len(self._active),
                 "evaluated": len(self._candidates), "note": self._status_note,
-                "done": self._done}
+                "done": self._done,
+                "member_stats": self._member_stats,
+                "best_per_round": self._best_per_round,
+                "arms": [{"seed": a.seed_name, "transform": a.transform,
+                          "mean_qbc": round(a.mean_score, 4), "n": len(a.scores),
+                          "magnitude": round(a.magnitude, 3)} for a in arms[:8]]}
+
+    @action
+    async def events(self, since: int = 0) -> list[dict]:
+        """Event stream (append-only); pass the count you've already seen."""
+        return self._events[since:]
 
     @action
     async def report(self) -> dict:
@@ -591,6 +770,173 @@ def print_report(report: dict, outdir: Path) -> None:
     print(f"\nwrote {outdir}/selected_structures.extxyz and committee_report.json")
 
 
+class Dashboard:
+    """Live terminal view of the committee: who is warm, who is scoring, who
+    struck out; the campaign's disagreement trend; the arms being chased.
+    Falls back to plain line logging (SLURM .out friendly) with --no-tui or
+    when stdout is not a terminal."""
+
+    STATE_STYLE = {"warming": ("◐", "yellow"), "seated": ("●", "green"),
+                   "scoring": ("◉", "bright_green"), "strike": ("◑", "red"),
+                   "dropped": ("✕", "red"), "never joined": ("○", "dim")}
+    SPARK = "▁▂▃▄▅▆▇█"
+
+    def __init__(self, title: str, pool: list[str], quorum: int, live: bool,
+                 svg_out: Path | None = None):
+        self.title, self.pool, self.quorum, self.live = title, pool, quorum, live
+        self.svg_out = svg_out
+        self.t0 = time.monotonic()
+        self.member: dict[str, dict] = {
+            n: {"state": "warming", "warm_s": None, "joined": None,
+                "n_evals": 0, "last_batch_s": None, "strikes": 0}
+            for n in pool}
+        self.status: dict = {}
+        self.events: list[dict] = []
+        self._rich = None
+        if live:
+            from rich.console import Console
+            from rich.live import Live
+            self._console = Console(record=True)
+            self._rich = Live(self._render(), console=self._console,
+                              refresh_per_second=4, screen=False)
+            self._rich.start()
+
+    # -- updates -----------------------------------------------------------
+    def warm(self, name: str, warm_s: float, joined_round: int | None) -> None:
+        m = self.member[name]
+        m.update(state="seated", warm_s=warm_s, joined=joined_round)
+        self.log(f"{name} warm in {warm_s:.0f}s"
+                 + (f" — seated for round {joined_round + 1}" if joined_round else ""))
+
+    def dropped(self, name: str, why: str) -> None:
+        self.member[name].update(state="dropped")
+        self.log(f"{name} DROPPED at startup: {why}")
+
+    def update_status(self, status: dict) -> None:
+        self.status = status
+        for name, st in status.get("member_stats", {}).items():
+            m = self.member.get(name)
+            if m is None:
+                continue
+            m.update(n_evals=st["n_evals"], last_batch_s=st["last_batch_s"])
+            if m["state"] != "dropped":
+                m["state"] = st["state"]
+        if self._rich:
+            self._rich.update(self._render())
+
+    def add_events(self, events: list[dict]) -> None:
+        for ev in events:
+            self.events.append(ev)
+            self.log(self._describe(ev), quiet=True)
+
+    def finish(self) -> None:
+        for m in self.member.values():
+            if m["state"] == "warming":
+                m["state"] = "never joined"
+        if self._rich:
+            self._rich.update(self._render())
+            self._rich.stop()
+            if self.svg_out is not None:
+                # Final board as a shareable image (Rich's own SVG export).
+                self._console.export_text(clear=True)  # drop Live's frames
+                self._console.print(self._render())
+                self._console.save_svg(str(self.svg_out), title=self.title)
+
+    def log(self, msg: str, quiet: bool = False) -> None:
+        if not self.live:
+            print(f"[t+{time.monotonic() - self.t0:5.0f}s] {msg}", flush=True)
+        elif not quiet:
+            self.events.append({"t": time.monotonic() - self.t0, "kind": "driver",
+                                "msg": msg})
+
+    @staticmethod
+    def _describe(ev: dict) -> str:
+        k = ev["kind"]
+        if k == "campaign_start":
+            return f"campaign start: {len(ev['members'])} members, {ev['n_seeds']} seeds, {ev['n_arms']} arms"
+        if k == "round_start":
+            return f"round {ev['round']}: {ev['n']} structures → {len(ev['members'])} members"
+        if k == "round_done":
+            return (f"round {ev['round']} best σF {ev['best']:.3f} eV/Å "
+                    f"{ev['seed']}/{ev['transform']}@{ev['magnitude']} → escalate to {ev['escalated_to']}")
+        if k == "member_joined":
+            return f"{ev['member']} joined the committee (round {ev['round']})"
+        if k == "member_failed":
+            return f"{ev['member']} strike {ev['strikes']}: {ev['error']}"
+        if k == "campaign_done":
+            return f"campaign done: {ev['evaluated']} scored; top {', '.join(ev['top'])}"
+        return ev.get("msg", k)
+
+    # -- rendering ---------------------------------------------------------
+    def _render(self):
+        from rich import box
+        from rich.console import Group
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+
+        st = self.status
+        elapsed = time.monotonic() - self.t0
+        head = Text.assemble(
+            (f" {self.title} ", "bold"),
+            (f"  t+{elapsed // 60:02.0f}:{elapsed % 60:02.0f}", "dim"),
+            (f"   round {st.get('round', 0)}/{st.get('rounds', '?')}", "cyan"),
+            (f"   {st.get('evaluated', 0)} scored", "dim"),
+            (f"   quorum {self.quorum}", "dim"))
+
+        mt = Table(box=box.SIMPLE_HEAD, expand=True, pad_edge=False,
+                   header_style="dim", show_edge=False)
+        for col, j in (("member", "left"), ("state", "left"), ("warm-up", "right"),
+                       ("evals", "right"), ("last batch", "right"), ("strikes", "right")):
+            mt.add_column(col, justify=j)
+        for name in self.pool:
+            m = self.member[name]
+            glyph, style = self.STATE_STYLE.get(m["state"], ("?", ""))
+            state = m["state"]
+            if m["joined"]:
+                state += f" (r{m['joined'] + 1})"
+            warm = "…" if m["warm_s"] is None else f"{m['warm_s']:.0f}s"
+            lb = "–" if m["last_batch_s"] is None else f"{m['last_batch_s']:.1f}s"
+            mt.add_row(Text(name, style=style if m["state"] in ("dropped", "never joined") else ""),
+                       Text(f"{glyph} {state}", style=style), warm,
+                       str(m["n_evals"]), lb, str(m["strikes"]))
+
+        best = st.get("best_per_round", [])
+        if best:
+            hi = max(best) or 1.0
+            spark = "".join(self.SPARK[min(7, int(b / hi * 7.999))] for b in best)
+            trend = Text.assemble(("σ(F) best/round  ", "dim"), (spark, "cyan"),
+                                  (f"  {best[-1]:.3f} eV/Å", "bold"))
+        else:
+            trend = Text("σ(F) best/round  waiting for first round…", style="dim")
+        note = Text(st.get("note", ""), style="dim")
+
+        at = Table(box=None, expand=True, pad_edge=False, header_style="dim")
+        at.add_column("arm"); at.add_column("mean σF", justify="right")
+        at.add_column("", ratio=2); at.add_column("n", justify="right")
+        at.add_column("→ magnitude", justify="right")
+        arms = st.get("arms", [])
+        amax = max((a["mean_qbc"] for a in arms), default=0) or 1.0
+        for a in arms[:8]:
+            bar = "█" * int(round(18 * a["mean_qbc"] / amax))
+            at.add_row(f"{a['seed']} · {a['transform']}", f"{a['mean_qbc']:.3f}",
+                       Text(bar, style="blue"), str(a["n"]), str(a["magnitude"]))
+
+        ev = Table(box=None, expand=True, pad_edge=False, show_header=False)
+        ev.add_column("t", justify="right", style="dim", width=7)
+        ev.add_column("event")
+        for e in self.events[-8:]:
+            ev.add_row(f"{e['t']:5.0f}s", self._describe(e) if "kind" in e else e["msg"])
+
+        return Group(
+            Panel(head, box=box.HEAVY, padding=(0, 0)),
+            Panel(mt, title="committee", title_align="left", box=box.ROUNDED),
+            Panel(Group(trend, note), title="campaign", title_align="left", box=box.ROUNDED),
+            Panel(at, title="arms (where the committee disagrees)", title_align="left", box=box.ROUNDED),
+            Panel(ev, title="events", title_align="left", box=box.ROUNDED),
+        )
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--cluster", default="delta",
@@ -624,11 +970,20 @@ async def main() -> None:
                              "fetch_mp_structures.py (default: mp_seeds.extxyz "
                              "next to this script)")
     parser.add_argument("--mock", action="store_true",
-                        help="EMT stand-ins instead of Rootstock (runs anywhere)")
+                        help="EMT/LJ stand-ins instead of Rootstock (runs anywhere)")
+    parser.add_argument("--builtin", choices=("cuau", "battery"), default=None,
+                        help="use built-in seeds instead of a seeds file")
+    parser.add_argument("--no-tui", action="store_true",
+                        help="plain line logging instead of the live dashboard "
+                             "(automatic when stdout is not a terminal)")
     args = parser.parse_args()
 
     seeds_path = args.seeds or Path(__file__).parent / "mp_seeds.extxyz"
-    if seeds_path.exists():
+    if args.builtin == "battery":
+        seeds = builtin_battery_seeds()
+    elif args.builtin == "cuau":
+        seeds = builtin_mock_seeds()
+    elif seeds_path.exists():
         seeds = load_seeds(seeds_path)
     elif args.mock:
         print(f"no seeds file at {seeds_path}; using built-in Cu/Au mock seeds")
@@ -654,6 +1009,15 @@ async def main() -> None:
         pool = resolve_committee(root, requested, args.pool_size)
     print(f"member pool: {', '.join(pool)}")
 
+    import sys
+    live_tui = not args.no_tui and sys.stdout.isatty()
+    dash = Dashboard(f"Academy × Rootstock committee — "
+                     f"{'mock' if args.mock else args.cluster}",
+                     pool, args.quorum, live=live_tui,
+                     svg_out=args.outdir / "committee_dashboard.svg")
+    args.outdir.mkdir(parents=True, exist_ok=True)
+    event_log = (args.outdir / "committee_events.jsonl").open("w")
+
     executor = ThreadPoolExecutor(max_workers=len(pool) + 4)
     campaign_done = False
     try:
@@ -664,8 +1028,8 @@ async def main() -> None:
       ) as manager:
         # Launch the whole pool at once; each member warms its model in
         # agent_on_startup, so the (expensive) model loads run in parallel.
-        print(f"launching {len(pool)} member agents (parallel model warm-up); "
-              f"campaign starts at quorum of {args.quorum}...")
+        dash.log(f"launching {len(pool)} member agents (parallel model warm-up); "
+                 f"campaign starts at quorum of {args.quorum}...")
         t0 = time.monotonic()
         handles: dict[str, Handle] = dict(zip(pool, await asyncio.gather(*(
             manager.launch(
@@ -683,16 +1047,17 @@ async def main() -> None:
         info_tasks = {asyncio.create_task(handles[c].info()): c for c in pool}
         pending = set(info_tasks)
 
+        current_round = 0
+
         def absorb(task) -> str | None:
             """Report one finished readiness task; member name if it warmed."""
             ckpt = info_tasks[task]
             exc = task.exception()
             if exc is not None:
                 cause = exc.__cause__ or exc.__context__ or exc
-                print(f"  {ckpt:<32s} DROPPED — startup failed: {cause} "
-                      "(full traceback in the agent error log above)")
+                dash.dropped(ckpt, f"{cause} (full traceback in the agent error log)")
                 return None
-            print(f"  {ckpt:<32s} warm in {task.result()['warmup_s']:6.1f}s")
+            dash.warm(ckpt, task.result()["warmup_s"], current_round or None)
             return ckpt
 
         active: set[str] = set()
@@ -702,8 +1067,8 @@ async def main() -> None:
             active.update(filter(None, map(absorb, ready)))
         if len(active) < 2:
             raise SystemExit("fewer than 2 committee members started; aborting")
-        print(f"quorum of {len(active)} reached at t+{time.monotonic() - t0:.0f}s"
-              f" — campaign starting ({len(pending)} members still warming)")
+        dash.log(f"quorum of {len(active)} reached at t+{time.monotonic() - t0:.0f}s"
+                 f" — campaign starting ({len(pending)} members still warming)")
 
         curator = await manager.launch(
             Curator,
@@ -716,30 +1081,42 @@ async def main() -> None:
             name="curator",
         )
 
-        last_line = None
+        last_line, n_seen = None, 0
+        poll = 1.0 if live_tui else 3.0
         while True:
             # Seat stragglers as they warm (asyncio.wait's timeout doubles
             # as the status-poll cadence).
             if pending:
                 ready, pending = await asyncio.wait(
-                    pending, timeout=3, return_when=asyncio.FIRST_COMPLETED)
+                    pending, timeout=poll, return_when=asyncio.FIRST_COMPLETED)
                 for name in filter(None, map(absorb, ready)):
                     await curator.activate_member(name)
             else:
-                await asyncio.sleep(3)
+                await asyncio.sleep(poll)
 
             status = await curator.status()
-            line = (f"[round {status['round']}/{status['rounds']}, "
-                    f"committee of {status['members']}] "
-                    f"{status['evaluated']} evaluated — {status['note']}")
-            if line != last_line:
-                print(line)
-                last_line = line
+            current_round = status["round"]
+            new_events = await curator.events(n_seen)
+            n_seen += len(new_events)
+            for ev in new_events:
+                event_log.write(json.dumps(ev) + "\n")
+            event_log.flush()
+            dash.add_events(new_events)
+            dash.update_status(status)
+            if not live_tui:
+                line = (f"[round {status['round']}/{status['rounds']}, "
+                        f"committee of {status['members']}] "
+                        f"{status['evaluated']} evaluated — {status['note']}")
+                if line != last_line:
+                    print(line, flush=True)
+                    last_line = line
             if status["done"]:
                 break
 
         for task in pending:  # campaign over; stop waiting on stragglers
             task.cancel()
+        dash.finish()
+        event_log.close()
         print_report(await curator.report(), args.outdir)
         campaign_done = True
     except Exception as exc:  # noqa: BLE001

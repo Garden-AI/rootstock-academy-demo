@@ -538,3 +538,50 @@ sharply on rattled and antisite-disordered configurations of the dilute
 CuAu₄ phase. **Bottom right** — the top selected structures themselves
 (element-colored: gold Au, brown Cu), i.e. the DFT shopping list this
 campaign exists to produce.
+
+### Interactive report
+
+`report_html.py` turns the same `committee_report.json` into a single
+self-contained HTML file (no CDN, no server — open it from a laptop, a login
+node, or a static host):
+
+```bash
+uv run report_html.py committee_results_12345/committee_report.json
+```
+
+Hover any structure in the campaign scatter, click a selected one, and it
+loads in a 3D viewer where you can color atoms by per-atom force
+disagreement and **toggle each committee member's force arrows** — the
+place where MACE and Orb push the same Cu atom in different directions is
+the place the campaign is telling you to spend DFT. A per-structure
+"who's the outlier" table gives each member's RMS force deviation from the
+committee mean and its energy offset, so lineage effects (which models
+cluster together, which one is odd out) show up structure by structure.
+The cluster drivers generate the report automatically after a run;
+[`committee_report_mock.html`](committee_report_mock.html) is the output of
+a `--mock` laptop run (EMT stand-ins, so the disagreement pattern is
+synthetic — the point is the wiring).
+
+### Live dashboard
+
+The driver renders the committee as a live terminal dashboard (rich):
+each member's state (warming → seated → scoring, strikes, dropped),
+warm-up time and batch latency; the σ(F) trend across rounds; the arms
+being escalated; and the Curator's event stream (also written to
+`committee_events.jsonl`). It falls back to plain line logging when stdout
+is not a terminal (SLURM/PBS `.out` files) or with `--no-tui`, and saves the
+final board as `committee_dashboard.svg` (mock run below):
+
+![Committee dashboard](committee_dashboard_mock.svg)
+
+### Battery variant
+
+The same campaign runs on Li-ion materials — `fetch_battery_seeds.py`
+pulls ~28 cathodes, anodes and solid electrolytes from the Materials
+Project, and seeds containing a mobile alkali get physics-appropriate arms:
+**delith** (remove Li), **hop** (kick one Li toward a neighbouring site) and
+**antisite** (Li/TM cation exchange, the LiFePO₄/LiNiO₂ defect).
+`--mock --builtin battery` runs it on a laptop with built-in textbook
+structures. Full Polaris instructions (install, seeds, PBS driver,
+interactive TUI session, outputs, troubleshooting):
+[`battery_campaign.md`](battery_campaign.md).

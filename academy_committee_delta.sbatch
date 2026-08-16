@@ -19,7 +19,7 @@
 # shell where `uv` resolves (`which uv` works).
 #
 # Stage the demo (from rootstock-scratch/):
-#   scp demos/academy_mlip_committee.py demos/mp_seeds.extxyz \
+#   scp demos/academy_mlip_committee.py demos/report_html.py demos/mp_seeds.extxyz \
 #       demos/academy_committee_delta.sbatch delta:~/
 # (mp_seeds.extxyz comes from fetch_mp_structures.py, run wherever you have
 #  an MP_API_KEY — the demo itself never talks to Materials Project.)
@@ -83,3 +83,7 @@ uv run "$SCRIPT_DIR/academy_mlip_committee.py" \
   --rounds 6 \
   --round-pause 60 \
   "$@"
+
+# Interactive report (self-contained HTML) next to the JSON.
+uv run "$SCRIPT_DIR/report_html.py" \
+  "committee_results_${SLURM_JOB_ID:-manual}/committee_report.json" || true

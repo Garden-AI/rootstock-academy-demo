@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# === Polaris (ALCF) driver for academy_mlip_committee.py ====================
+#PBS -N academy-committee
+#PBS -A Garden-AI
+#PBS -q debug
+#PBS -l select=1:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:eagle
+#PBS -j oe
+# ==========================================================================
+#
+# Same demo as academy_committee_delta.sbatch / academy_committee_sophia.pbs,
+# on a Polaris node (4x A100 40 GB; all committee members share GPU 0 —
+# the cells are small, model-load time dominates).  Polaris facts baked in:
+# PBS does not propagate the submit shell's environment, compute nodes
+# reach the internet only through the ALCF proxy, and uv lives in
+# ~/.local/bin.  Full walkthrough: battery_campaign.md.
+#
+# Kickoff (from the directory holding these files, on a Polaris login node):
+#   qsub academy_committee_polaris.pbs
+# Extra demo args go via -v (PBS has no sbatch-style passthrough):
+#   qsub -v EXTRA_ARGS="--seeds battery_seeds.extxyz --rounds 8" academy_committee_polaris.pbs
+# For a longer run switch the queue:  qsub -q prod -l walltime=02:00:00 ...
+
+set -euo pipefail
+
+umask 0002
+export PATH="$HOME/.local/bin:$PATH"   # uv (PBS jobs start with minimal PATH)
+cd "${PBS_O_WORKDIR:-$HOME}"
+
+# ALCF compute nodes have no direct outbound network; uv resolving the demo's
+# PEP 723 deps and any checkpoint gating re-check need the proxy.
+export HTTP_PROXY="${HTTP_PROXY:-http://proxy.alcf.anl.gov:3128}"
+export HTTPS_PROXY="${HTTPS_PROXY:-http://proxy.alcf.anl.gov:3128}"
+export http_proxy="$HTTP_PROXY"
+export https_proxy="$HTTPS_PROXY"
+
+# Stream progress into the PBS .o file as it happens; plain logging (the
+# live TUI needs a terminal — use it from an interactive `qsub -I` session).
+export PYTHONUNBUFFERED=1
+# Worker-side log to a real file: "stderr" would vanish into the server's
+# captured tempfiles.
+export ROOTSTOCK_WORKER_LOG="${PBS_O_WORKDIR:-$PWD}/rootstock-workers-${PBS_JOBID%%.*}.log"
+
+# HF token for gated checkpoints (uma).  Weights are cached in the install,
+# but some setups re-check gating at load time.
+if [[ -f ~/.cache/huggingface/token ]]; then
+  export HF_TOKEN="$(cat ~/.cache/huggingface/token)"
+  export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+fi
+
+nvidia-smi | head -4 || true
+echo "=== academy_mlip_committee.py (cluster=polaris) ==="
+
+OUTDIR="committee_results_${PBS_JOBID%%.*}"
+uv run academy_mlip_committee.py \
+  --cluster polaris \
+  --outdir "$OUTDIR" \
+  --timeout 2700 \
+  --rounds 6 \
+  --round-pause 60 \
+  ${EXTRA_ARGS:-}
+
+# Interactive report (self-contained HTML) + summary figure next to the JSON.
+uv run report_html.py "$OUTDIR/committee_report.json" || true
+uv run visualize_committee.py "$OUTDIR" || true
