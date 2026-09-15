@@ -1,7 +1,9 @@
 # A self-steering MLIP committee, built from Academy agents and Rootstock
 
-*Demo: autonomous query-by-committee over Materials Project Cu–Au phases,
-run on NCSA Delta (companion driver for ALCF Sophia included).*
+*Demo: autonomous query-by-committee over Cu–Au phases. Single-cluster
+version run on NCSA Delta (companion driver for ALCF Sophia included);
+federated version, one file run with `hog run` against facility Globus
+Compute endpoints, in the last section.*
 
 ## Why would a scientist care?
 
@@ -538,3 +540,111 @@ sharply on rattled and antisite-disordered configurations of the dilute
 CuAu₄ phase. **Bottom right** — the top selected structures themselves
 (element-colored: gold Au, brown Cu), i.e. the DFT shopping list this
 campaign exists to produce.
+
+## Going federated: one file, two facilities
+
+Everything above runs inside a single batch job on one cluster. Nothing in
+the campaign requires that: members only ever see plain-data structures
+arriving through Academy's exchange, and each member's MLIP is whatever its
+local Rootstock install provides. So the natural next step is a committee
+whose members live on different HPC facilities, with the campaign driven
+from a laptop.
+
+[`federated_mlip_committee.py`](federated_mlip_committee.py) is that
+version, and it is a single file you can run today:
+
+```
+hog run federated_mlip_committee.py probe -- --sites delta,polaris
+hog run federated_mlip_committee.py -- --rounds 8
+```
+
+Three tools, each doing one job:
+
+- **[Rootstock](https://github.com/Garden-AI/rootstock)** gives every member
+  a warm calculator backed by that cluster's pre-built, verified
+  environments. Members are only launched where the install's manifest marks
+  the checkpoint verified.
+- **[Academy](https://docs.academy-agents.org)** provides the agents and the
+  messaging. The Curator runs in the driver process; members connect back
+  over Academy's hosted, Globus-authenticated HTTP exchange from wherever
+  they run.
+- **[groundhog](https://groundhog-hpc.readthedocs.io)** does the deployment.
+  Each member agent's whole lifetime is one task on that facility's
+  [Globus Compute](https://globus-compute.readthedocs.io) multi-user
+  endpoint. groundhog ships the script to the site and builds its Python
+  environment there with uv, from the script's own PEP 723 header. Per-site
+  scheduler details live in `[tool.hog.<site>]` tables in the same header;
+  every key other than `endpoint` is passed through as the endpoint's user
+  configuration. Replace the two `account` values with your own allocations
+  and the script runs unmodified.
+
+The glue between Academy and groundhog is one class. Academy's `Manager`
+launches agents through any `concurrent.futures.Executor`; `GroundhogExecutor`
+forwards Academy's agent runner to a `@hog.function` on the site's endpoint:
+
+```python
+@hog.function()
+def run_task(fn, *args):
+    """One Globus Compute task hosts one Academy agent for its whole lifetime."""
+    return fn(*args)
+
+
+class GroundhogExecutor(Executor):
+    def __init__(self, site: str):
+        self.site = site
+
+    def submit(self, fn, /, *args, **kwargs) -> Future:
+        return run_task.submit(fn, *args, endpoint=self.site, **kwargs)
+```
+
+Members are named `checkpoint@site`, so the report shows where every opinion
+came from.
+
+### What a run looks like
+
+Member start-up is dominated by Rootstock loading a model from a cold
+parallel filesystem, and sites have queues, so the campaign starts as soon
+as `--quorum` members are ready and seats the rest as they come up.
+
+The run below (2026-09-15) placed six members across two Globus Compute
+jobs on NCSA Delta. Two members were warm after about ten minutes and
+founded the committee; the other four joined from round 2. Rendered by
+[`visualize_federated_committee.py`](visualize_federated_committee.py):
+
+![Federated committee campaign summary](federated_committee_summary.png)
+
+```
+08:39:17 READY pet-omatpes-l@delta on gpua076.delta.ncsa.illinois.edu (NVIDIA A100-SXM4-40GB) after 607 s
+08:39:18 READY sevennet-omat@delta on gpua076.delta.ncsa.illinois.edu (NVIDIA A100-SXM4-40GB) after 610 s
+08:39:18 Campaign starts with 2 members: pet-omatpes-l@delta, sevennet-omat@delta
+08:39:22 round 1/16: 12 structures x 2 members; most disagreement 0.045 eV/A on Cu3Au/rattle; ...
+08:39:59 READY mace-mp-0-medium@delta on gpua069.delta.ncsa.illinois.edu (NVIDIA A100-SXM4-40GB) after 623 s
+08:39:59 JOINED mace-mp-0-medium@delta from round 2
+08:40:11 READY dpa-3.1-3m@delta on gpua069.delta.ncsa.illinois.edu (NVIDIA A100-SXM4-40GB) after 633 s
+08:40:11 JOINED dpa-3.1-3m@delta from round 2
+08:43:08 READY orb-v3-conservative-inf-omat@delta on gpua069.delta.ncsa.illinois.edu (NVIDIA A100-SXM4-40GB) after 811 s
+08:43:08 JOINED orb-v3-conservative-inf-omat@delta from round 2
+08:44:21 READY grace-3l-omat-large-ft-am@delta on gpua076.delta.ncsa.illinois.edu (NVIDIA A100-SXM4-40GB) after 911 s
+08:44:21 JOINED grace-3l-omat-large-ft-am@delta from round 2
+08:45:16 round 2/16: 12 structures x 6 members; most disagreement 0.113 eV/A on Cu3Au/swap; ...
+```
+
+Two honest caveats about that run. It was meant to span Delta and ALCF
+Polaris, but Polaris queue waits exceeded the window, so both jobs landed on
+Delta; the Polaris path itself was exercised separately (members ready in
+98 to 120 s on 2026-09-11). And the version of the script that ran had no
+ceiling on how far the Curator could escalate a perturbation arm, so from
+round 9 the rattle amplitude passed physical magnitudes; the figure shows
+rounds 1 to 8, and the script now caps each arm (`ARM_CAPS`).
+
+### Facility notes
+
+Both multi-user endpoints needed a `worker_init` in the header, for
+different reasons. On Delta, supplying any `worker_init` replaces the
+endpoint's default worker bootstrap, so the table rebuilds the worker venv
+itself. On Polaris, the endpoint's venv must come first on `PATH` (a
+personal Globus Compute install in `~/.local/bin` otherwise shadows it),
+`CC=gcc` is needed because the job shell exports `CC=nvc` and Triton cannot
+build with it, and outbound traffic must go through the ALCF proxy. The
+header carries all of this, so it is documentation as much as configuration.
+groundhog 0.9.3 or newer is required.
